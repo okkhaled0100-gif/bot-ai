@@ -1,7 +1,7 @@
-import asyncio
-import json
 import logging
+import json
 import os
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -26,12 +26,18 @@ SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "أنت مساعد ذكي ودود تتحدث العربية بطلاقة. أجب باختصار ووضوح ومن دون حشو.",
 )
-MAX_TURNS = int(os.getenv("MAX_TURNS", "10"))  # عدد أزواج (سؤال+جواب) المحفوظة في السياق
+MAX_TURNS = int(os.getenv("MAX_TURNS", "10"))            # أزواج (سؤال+جواب) المحفوظة
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "8000"))  # gpt-5.5 يستهلك توكنات تفكير كثيرة
+ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "1") == "1"
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 BASE_URL = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
+
+# توقيت السعودية ثابت UTC+3 بلا توقيت صيفي
+KSA = timezone(timedelta(hours=3))
+AR_DAYS = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
 
 # ---------- العملاء ----------
 oai = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -54,17 +60,38 @@ async def load_history(user_id: int):
     return []
 
 async def save_history(user_id: int, history):
-    trimmed = history[-(MAX_TURNS * 2):]
-    await _doc(user_id).set({"history": trimmed})
+    await _doc(user_id).set({"history": history[-(MAX_TURNS * 2):]})
 
 async def clear_history(user_id: int):
     await _doc(user_id).set({"history": []})
 
-# ---------- استدعاء OpenAI ----------
+# ---------- تعليمات النظام مع الوقت الحالي ----------
+def build_instructions():
+    now = datetime.now(KSA)
+    stamp = f"{AR_DAYS[now.weekday()]} {now.strftime('%Y-%m-%d %H:%M')}"
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"معلومة آنية موثوقة: الوقت الآن {stamp} بتوقيت السعودية (UTC+3). "
+        "استخدم هذا الوقت مباشرة لأي سؤال عن الوقت أو التاريخ ولا تقل إنك لا تعرفه. "
+        "إذا احتاج السؤال معلومات حديثة (أخبار، أسعار، نتائج مباريات…) استخدم أداة البحث في الويب."
+    )
+
+# ---------- استدعاء OpenAI عبر Responses API ----------
 async def ask_ai(history):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-    resp = await oai.chat.completions.create(model=OPENAI_MODEL, messages=messages)
-    return (resp.choices[0].message.content or "").strip()
+    kwargs = dict(
+        model=OPENAI_MODEL,
+        instructions=build_instructions(),
+        input=history,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+    )
+    if ENABLE_WEB_SEARCH:
+        kwargs["tools"] = [{
+            "type": "web_search",
+            "user_location": {"type": "approximate", "country": "SA", "timezone": "Asia/Riyadh"},
+        }]
+    resp = await oai.responses.create(**kwargs)
+    text = (resp.output_text or "").strip()
+    return text or "ما قدرت أطلّع جواب كامل، جرّب تعيد صياغة السؤال. 🙏"
 
 # ---------- تقسيم الرسائل الطويلة (حد تيليجرام 4096) ----------
 def split_text(text, limit=4000):
@@ -74,9 +101,8 @@ def split_text(text, limit=4000):
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "أهلاً! 👋 أنا بوت ذكاء اصطناعي مدعوم بـ "
-        f"{OPENAI_MODEL}.\n"
-        "اكتب أي شي وراح أرد عليك، وأتذكّر سياق محادثتنا.\n\n"
+        f"أهلاً! 👋 أنا بوت ذكاء اصطناعي مدعوم بـ {OPENAI_MODEL} مع بحث في الإنترنت.\n"
+        "اسألني أي شي وراح أرد عليك وأتذكّر سياق محادثتنا.\n\n"
         "/reset — مسح المحادثة والبدء من جديد\n"
         "/model — معرفة الموديل الحالي"
     )
@@ -88,7 +114,8 @@ async def cmd_reset(message: Message):
 
 @dp.message(Command("model"))
 async def cmd_model(message: Message):
-    await message.answer(f"الموديل الحالي: {OPENAI_MODEL}")
+    state = "مفعّل" if ENABLE_WEB_SEARCH else "معطّل"
+    await message.answer(f"الموديل: {OPENAI_MODEL}\nبحث الإنترنت: {state}")
 
 # ---------- الرسائل النصية ----------
 @dp.message(F.text & ~F.text.startswith("/"))
